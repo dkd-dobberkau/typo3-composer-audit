@@ -1,0 +1,5 @@
+__pycache__/
+*.py[oc]
+.venv/
+*.cdx.json
+sbom.json
