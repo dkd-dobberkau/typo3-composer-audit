@@ -115,6 +115,7 @@ def _lock(*pakete):
     return json.dumps({"packages": list(pakete), "packages-dev": []}).encode()
 
 
+
 def _pkg(name, version="1.0.0"):
     return {"name": name, "version": version, "type": "typo3-cms-extension",
             "require": {}, "dist": {}, "source": {}}
@@ -152,6 +153,116 @@ def test_an_incomplete_scan_does_not_exit_zero(monkeypatch, tmp_path):
     lock = tmp_path / "composer.lock"
     lock.write_bytes(_lock(_pkg("a/one")))
     assert audit.main([str(lock)]) == 1
+
+
+
+
+# --- private packages must not leave the machine -----------------------------
+#
+# Packagist is an external service. A composer.lock from a customer carries the
+# names of their private extensions, and querying them sends those names out.
+# The lockfile says which is which: packages pulled from Packagist carry a
+# notification-url, packages from a path or private repository do not. On the
+# production lockfile this separates 17 public from 10 private extensions.
+
+
+def _lock_entry(name, private=False, typ="typo3-cms-extension"):
+    entry = {"name": name, "version": "1.0.0", "type": typ, "require": {}}
+    if not private:
+        entry["notification-url"] = "https://packagist.org/downloads/"
+    return entry
+
+
+def test_public_origin_is_read_from_the_lockfile():
+    nodes, _ = audit.build_packages(audit.parse_lock_bytes(
+        _lock(_lock_entry("georgringer/news"))
+    ))
+    assert nodes[0]["props"]["public"] is True
+
+
+def test_missing_notification_url_means_private():
+    nodes, _ = audit.build_packages(audit.parse_lock_bytes(
+        _lock(_lock_entry("acme/private-ext", private=True))
+    ))
+    assert nodes[0]["props"]["public"] is False
+
+
+def test_private_package_name_is_never_sent(monkeypatch):
+    """The promise this filter makes. Not believed — measured."""
+    gesendet = []
+
+    def spy(client, pkg_name, target_major, current_version=""):
+        gesendet.append(pkg_name)
+        return {"upgrade_status": "green"}
+
+    monkeypatch.setattr(audit, "_check_upgrade_single", spy)
+    nodes, _ = audit.build_packages(audit.parse_lock_bytes(_lock(
+        _lock_entry("georgringer/news"),
+        _lock_entry("acme/private-ext", private=True),
+    )))
+    audit.check_upgrade_batch(nodes, 14)
+
+    assert gesendet == ["georgringer/news"]
+
+
+def test_private_package_is_reported_not_dropped(monkeypatch):
+    """Not querying it is not the same as it being fine — nor as it being
+    broken. It needs a human, and it has to appear in the report to get one."""
+    monkeypatch.setattr(
+        audit, "_check_upgrade_single",
+        lambda *a, **k: {"upgrade_status": "green"},
+    )
+    nodes, _ = audit.build_packages(audit.parse_lock_bytes(
+        _lock(_lock_entry("acme/private-ext", private=True))
+    ))
+    audit.check_upgrade_batch(nodes, 14)
+
+    assert nodes[0]["props"]["upgrade_status"] == "private"
+    assert "not queried" in nodes[0]["props"]["upgrade_note"]
+
+
+def test_private_packages_are_counted_in_the_summary(monkeypatch):
+    monkeypatch.setattr(audit, "check_vulns_batch", lambda nodes: {"ok": True, "error": ""})
+    monkeypatch.setattr(
+        audit, "_check_upgrade_single",
+        lambda *a, **k: {"upgrade_status": "green"},
+    )
+    report = audit.run_audit(
+        _lock(_lock_entry("a/public"), _lock_entry("acme/another-private", private=True)),
+        target_major=14,
+    )
+    up = report["upgrade"]
+    assert (up["green"], up["private"]) == (1, 1)
+
+
+def test_private_names_do_not_go_to_osv_either(monkeypatch):
+    """Packagist is not the only way out. The vulnerability scan sends every
+    package name to osv.dev, so a filter that only covers Packagist protects
+    nothing."""
+    gesendet = []
+
+    def spy(queries):
+        gesendet.extend(q["package"]["name"] for q in queries)
+        return [{} for _ in queries]
+
+    monkeypatch.setattr(audit, "_query_osv_batch", spy)
+    nodes, _ = audit.build_packages(audit.parse_lock_bytes(_lock(
+        _lock_entry("georgringer/news"),
+        _lock_entry("acme/private-ext", private=True),
+    )))
+    audit.check_vulns_batch(nodes)
+
+    assert gesendet == ["georgringer/news"]
+
+
+def test_a_private_package_is_marked_as_not_scanned(monkeypatch):
+    monkeypatch.setattr(audit, "_query_osv_batch", lambda queries: [{} for _ in queries])
+    nodes, _ = audit.build_packages(audit.parse_lock_bytes(
+        _lock(_lock_entry("acme/private-ext", private=True))
+    ))
+    audit.check_vulns_batch(nodes)
+
+    assert nodes[0]["props"]["vuln_scan"] == "not scanned — private package"
 
 
 if __name__ == "__main__":

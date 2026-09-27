@@ -33,13 +33,18 @@ PACKAGIST_PKG = "https://packagist.org/packages/{name}.json"
 #: constraint anywhere) and `unreachable` (no answer at all) are three
 #: different things and must never collapse into one.
 UPGRADE_STATUSES = (
-    "green", "yellow", "current", "red", "unknown", "unverifiable", "unreachable",
+    "green", "yellow", "current", "red",
+    "private", "unknown", "unverifiable", "unreachable",
 )
 
 #: Any requirement on one of the core's split packages answers the target
 #: question — they are released in lockstep. typo3/cms-core is preferred as the
 #: reported source when a package names it, because "^14.3 on cms-backend" is a
 #: different promise from the same string on cms-core.
+#: Packagist's mark in composer.lock. Its absence means a path or private
+#: repository — and such a name must not leave the machine.
+PACKAGIST_HOST = "packagist.org"
+
 TYPO3_CORE_PREFIX = "typo3/cms"
 TYPO3_CORE = "typo3/cms-core"
 OSV_QUERY_BATCH = "https://api.osv.dev/v1/querybatch"
@@ -100,7 +105,14 @@ def build_packages(packages: list[dict]) -> tuple[list[dict], list[dict]]:
         is_core = name == "typo3/cms-core"
         label = "Framework" if is_core else "Package"
 
-        props: dict = {"version": pkg.get("version", "")}
+        # Where the package came from. Packages pulled from Packagist carry a
+        # notification-url; those from a path or private repository do not. This
+        # is not a guess — the lockfile states it, and it decides whether the
+        # name may be sent to an external service.
+        props: dict = {
+            "version": pkg.get("version", ""),
+            "public": PACKAGIST_HOST in str(pkg.get("notification-url") or ""),
+        }
         if pkg.get("dev"):
             props["dev"] = True
         if pkg.get("description"):
@@ -309,13 +321,31 @@ def _check_upgrade_single(
 
 
 def check_upgrade_batch(nodes: list[dict], target_major: int) -> None:
-    """Check Packagist upgrade readiness for all TYPO3-typed packages. Mutates nodes in-place."""
+    """Check Packagist upgrade readiness for all TYPO3-typed packages. Mutates nodes in-place.
+
+    Packages from a path or private repository are never sent to Packagist.
+    They are reported as ``private`` instead: not querying a package is not the
+    same as the package being fine, and it is not the same as it being broken
+    either. Somebody has to look, and it has to appear in the report to get
+    somebody to look.
+    """
     typo3_pkgs = [n for n in nodes if n["props"].get("type", "").startswith("typo3-cms-")]
     if not typo3_pkgs:
         return
 
+    public = [n for n in typo3_pkgs if n["props"].get("public")]
+    for n in typo3_pkgs:
+        if not n["props"].get("public"):
+            n["props"].update({
+                "upgrade_status": "private",
+                "upgrade_note": "not queried — no Packagist origin in the lockfile; "
+                                "check target compatibility by hand",
+            })
+    if not public:
+        return
+
     with httpx.Client(timeout=30, follow_redirects=True) as client:
-        for n in typo3_pkgs:
+        for n in public:
             current = n["props"].get("version", "")
             result = _check_upgrade_single(client, n["name"], target_major, current_version=current)
             n["props"].update(result)
@@ -420,6 +450,11 @@ def check_vulns_batch(nodes: list[dict]) -> dict:
     Returns the scan status as {"ok": bool, "error": str}. Callers must not
     read "no vulns on any node" as an all-clear without checking `ok` — a
     failed scan leaves the nodes untouched and looks identical.
+
+    Packages from a path or private repository are not sent: OSV has no data on
+    them, and the request would hand their names to an external service for
+    nothing. They carry ``vuln_scan`` saying so, because "no advisories found"
+    and "never asked" must not look the same.
     """
     # Kept in step with `queries`: nodes without a version are never queried,
     # so results must be mapped back through this list, not through `nodes`.
@@ -428,6 +463,12 @@ def check_vulns_batch(nodes: list[dict]) -> dict:
     for node in nodes:
         version = node["props"].get("version", "").lstrip("v")
         if not version:
+            continue
+        # Packagist is not the only way out of the machine. A private package
+        # name sent to osv.dev has left just the same — and OSV has no data on
+        # it either, so the request buys nothing.
+        if not node["props"].get("public"):
+            node["props"]["vuln_scan"] = "not scanned — private package"
             continue
         queried_nodes.append(node)
         queries.append({
@@ -637,8 +678,9 @@ def main(argv: list[str] | None = None) -> int:
     print(f"Upgrade to {up['target']}: {up['green']} ready, {up['current']} already there, "
           f"{up['yellow']} pre-release only, {up['red']} blocked")
     # Not a footnote: these are the packages about which nothing was learned.
-    if up["unknown"] or up["unverifiable"] or up["unreachable"]:
-        print(f"  not answered: {up['unknown']} unknown to Packagist, "
+    if any(up[s] for s in ("private", "unknown", "unverifiable", "unreachable")):
+        print(f"  not answered: {up['private']} private (not queried), "
+              f"{up['unknown']} unknown to Packagist, "
               f"{up['unverifiable']} without a typo3/cms-* constraint, "
               f"{up['unreachable']} unreachable")
     if sec["scan_ok"]:
