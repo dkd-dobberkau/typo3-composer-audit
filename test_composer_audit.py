@@ -265,5 +265,80 @@ def test_a_private_package_is_marked_as_not_scanned(monkeypatch):
     assert nodes[0]["props"]["vuln_scan"] == "not scanned — private package"
 
 
+# --- a branch is not a release -----------------------------------------------
+#
+# t3g/usercentrics is installed from dev-feature/v13-compatibility. Asking
+# Packagist whether a *release* supports the target says nothing about what
+# sits in that branch, so reporting "no release supports it — this blocks the
+# upgrade" claims knowledge nobody has. On the production lockfile this was the
+# single remaining red, and it was wrong.
+
+
+def _branch_entry(name, version, private=False):
+    entry = _lock_entry(name, private=private)
+    entry["version"] = version
+    return entry
+
+
+def _nodes(*entries):
+    return audit.build_packages(audit.parse_lock_bytes(_lock(*entries)))[0]
+
+
+def test_dev_branch_is_recognised(monkeypatch):
+    monkeypatch.setattr(audit, "_check_upgrade_single", lambda *a, **k: {"upgrade_status": "green"})
+    nodes = _nodes(_branch_entry("t3g/usercentrics", "dev-feature/v13-compatibility"))
+    audit.check_upgrade_batch(nodes, 14)
+    assert nodes[0]["props"]["upgrade_status"] == "dev-branch"
+
+
+def test_dev_suffix_is_recognised(monkeypatch):
+    monkeypatch.setattr(audit, "_check_upgrade_single", lambda *a, **k: {"upgrade_status": "green"})
+    nodes = _nodes(_branch_entry("a/b", "1.x-dev"))
+    audit.check_upgrade_batch(nodes, 14)
+    assert nodes[0]["props"]["upgrade_status"] == "dev-branch"
+
+
+def test_a_branch_is_not_queried(monkeypatch):
+    """Not just wrong to report — pointless to ask."""
+    gesendet = []
+    monkeypatch.setattr(
+        audit, "_check_upgrade_single",
+        lambda client, name, *a, **k: (gesendet.append(name), {"upgrade_status": "green"})[1],
+    )
+    nodes = _nodes(_branch_entry("a/pinned", "1.0.0"), _branch_entry("a/branch", "dev-main"))
+    audit.check_upgrade_batch(nodes, 14)
+    assert gesendet == ["a/pinned"]
+
+
+def test_a_private_branch_is_reported_as_a_branch(monkeypatch):
+    """Both apply; the branch is the one that guides the next step. A Packagist
+    entry would not help either way."""
+    monkeypatch.setattr(audit, "_check_upgrade_single", lambda *a, **k: {"upgrade_status": "green"})
+    nodes = _nodes(_branch_entry("acme/site-package", "dev-stage", private=True))
+    audit.check_upgrade_batch(nodes, 14)
+    assert nodes[0]["props"]["upgrade_status"] == "dev-branch"
+
+
+def test_branches_are_counted_in_the_summary(monkeypatch):
+    monkeypatch.setattr(audit, "check_vulns_batch", lambda nodes: {"ok": True, "error": ""})
+    monkeypatch.setattr(audit, "_check_upgrade_single", lambda *a, **k: {"upgrade_status": "green"})
+    report = audit.run_audit(
+        _lock(_lock_entry("a/public"), _branch_entry("a/branch", "dev-main")),
+        target_major=14,
+    )
+    up = report["upgrade"]
+    assert (up["green"], up["dev-branch"]) == (1, 1)
+
+
+def test_a_branch_does_not_make_the_exit_code_non_zero(monkeypatch, tmp_path):
+    """It is unfinished information, not a blocker. Calling it blocked was the
+    bug."""
+    monkeypatch.setattr(audit, "check_vulns_batch", lambda nodes: {"ok": True, "error": ""})
+    monkeypatch.setattr(audit, "_check_upgrade_single", lambda *a, **k: {"upgrade_status": "green"})
+    lock = tmp_path / "composer.lock"
+    lock.write_bytes(_lock(_branch_entry("a/branch", "dev-main")))
+    assert audit.main([str(lock)]) == 0
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__]))

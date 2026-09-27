@@ -38,14 +38,21 @@ Asks Packagist whether each TYPO3 extension has a release whose
 | `yellow` | only a pre-release supports it |
 | `current` | the installed version already supports it |
 | `red` | no release supports it — this blocks the upgrade |
+| `dev-branch` | a branch is installed, not a release — nothing to ask about |
 | `private` | from a path or private repository — never queried, never sent |
 | `unknown` | Packagist answered: no such package |
 | `unverifiable` | no release declares any `typo3/cms-*` constraint |
 | `unreachable` | no answer at all — the channel is broken, not the package |
 
-The last four are not footnotes. They are the packages about which nothing was
+The last five are not footnotes. They are the packages about which nothing was
 learned, they are printed under the summary line, and `unreachable` makes the
 exit code non-zero. A package nobody could check is not a package that is fine.
+
+`dev-branch` and `private` do not make the exit code non-zero: they are
+unfinished information, not blockers. Reporting a branch as `red` was a bug —
+asking whether a *release* supports the target says nothing about what sits in
+the branch that is actually installed. Pin a version and the question becomes
+answerable.
 
 **Any `typo3/cms-*` requirement answers the question, and all of them must
 admit the target.** The core's split packages are released in lockstep, and not

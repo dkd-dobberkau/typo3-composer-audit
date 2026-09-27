@@ -34,7 +34,7 @@ PACKAGIST_PKG = "https://packagist.org/packages/{name}.json"
 #: different things and must never collapse into one.
 UPGRADE_STATUSES = (
     "green", "yellow", "current", "red",
-    "private", "unknown", "unverifiable", "unreachable",
+    "dev-branch", "private", "unknown", "unverifiable", "unreachable",
 )
 
 #: Any requirement on one of the core's split packages answers the target
@@ -320,32 +320,53 @@ def _check_upgrade_single(
     return {"upgrade_status": "red"}
 
 
+def _is_dev_branch(version: str) -> bool:
+    """Is a branch installed rather than a release?"""
+    return version.startswith("dev-") or version.endswith("-dev")
+
+
 def check_upgrade_batch(nodes: list[dict], target_major: int) -> None:
     """Check Packagist upgrade readiness for all TYPO3-typed packages. Mutates nodes in-place.
 
-    Packages from a path or private repository are never sent to Packagist.
-    They are reported as ``private`` instead: not querying a package is not the
-    same as the package being fine, and it is not the same as it being broken
-    either. Somebody has to look, and it has to appear in the report to get
-    somebody to look.
+    Two kinds of package are never sent to Packagist, and neither is reported
+    as blocked — being unable to ask is not an answer:
+
+    * packages from a path or private repository (``private``),
+    * packages installed from a branch rather than a release (``dev-branch``).
+      Asking whether a *release* supports the target says nothing about what
+      sits in that branch, so the old ``red`` claimed knowledge nobody has.
+
+    Not querying a package is not the same as the package being fine, and not
+    the same as it being broken. Somebody has to look, and it has to appear in
+    the report to get somebody to look.
     """
     typo3_pkgs = [n for n in nodes if n["props"].get("type", "").startswith("typo3-cms-")]
     if not typo3_pkgs:
         return
 
-    public = [n for n in typo3_pkgs if n["props"].get("public")]
+    to_query = []
     for n in typo3_pkgs:
-        if not n["props"].get("public"):
+        if _is_dev_branch(str(n["props"].get("version") or "")):
+            # Both may apply to one package; the branch is the one that guides
+            # the next step, and a Packagist entry would not help either way.
+            n["props"].update({
+                "upgrade_status": "dev-branch",
+                "upgrade_note": "a branch is installed, not a release — what Packagist "
+                                "says about releases does not describe it; pin a version first",
+            })
+        elif not n["props"].get("public"):
             n["props"].update({
                 "upgrade_status": "private",
                 "upgrade_note": "not queried — no Packagist origin in the lockfile; "
                                 "check target compatibility by hand",
             })
-    if not public:
+        else:
+            to_query.append(n)
+    if not to_query:
         return
 
     with httpx.Client(timeout=30, follow_redirects=True) as client:
-        for n in public:
+        for n in to_query:
             current = n["props"].get("version", "")
             result = _check_upgrade_single(client, n["name"], target_major, current_version=current)
             n["props"].update(result)
@@ -678,8 +699,9 @@ def main(argv: list[str] | None = None) -> int:
     print(f"Upgrade to {up['target']}: {up['green']} ready, {up['current']} already there, "
           f"{up['yellow']} pre-release only, {up['red']} blocked")
     # Not a footnote: these are the packages about which nothing was learned.
-    if any(up[s] for s in ("private", "unknown", "unverifiable", "unreachable")):
-        print(f"  not answered: {up['private']} private (not queried), "
+    if any(up[s] for s in ("dev-branch", "private", "unknown", "unverifiable", "unreachable")):
+        print(f"  not answered: {up['dev-branch']} on a branch, "
+              f"{up['private']} private (not queried), "
               f"{up['unknown']} unknown to Packagist, "
               f"{up['unverifiable']} without a typo3/cms-* constraint, "
               f"{up['unreachable']} unreachable")
